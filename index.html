@@ -105,7 +105,10 @@ function formatDate(input) {
 
 //==== IndexedDB storage layer ====
 const IDB_NAME = 'ibraDB';
-const IDB_VERSION = 1;
+// NOTE: never lower this number again - a browser that has already opened
+// the DB at a higher version (e.g. during earlier testing) will throw
+// VersionError if a page later requests a lower version. Always bump forward.
+const IDB_VERSION = 3;
 let idbPromise;
 
 function openDB() {
@@ -126,6 +129,14 @@ function openDB() {
       if (!db.objectStoreNames.contains('meta')) {
         db.createObjectStore('meta');
       }
+      // Note: an old 'photoBlobs' store may exist from earlier testing.
+      // It's unused now and harmless to leave in place.
+    };
+    req.onblocked = () => {
+      // Another tab still has an older-version connection open, so the
+      // upgrade can't proceed. Fail loudly instead of hanging forever.
+      console.error('IndexedDB upgrade blocked - close other open tabs of this app and reload.');
+      reject(new Error('IndexedDB upgrade blocked by another open tab'));
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -361,7 +372,11 @@ document.getElementById("datadate").innerHTML= new Date().toLocaleString('en-GB'
   }
   
 }
-initReport();
+initReport().catch(err => {
+  console.error('initReport failed:', err);
+  document.getElementById("loader").style.display = "none";
+  document.getElementById("DataLoadedFrom").textContent = "Could not load data. Please reload the page.";
+});
 
 
 function processData(addBookData, photoData) {
