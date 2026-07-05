@@ -105,7 +105,7 @@ function formatDate(input) {
 
 //==== IndexedDB storage layer ====
 const IDB_NAME = 'ibraDB';
-const IDB_VERSION = 2; // bumped to add photoBlobs store for existing installs
+const IDB_VERSION = 1;
 let idbPromise;
 
 function openDB() {
@@ -122,10 +122,6 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains('photos')) {
         db.createObjectStore('photos', { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains('photoBlobs')) {
-        // stores { id, photoid, blob } - actual cached image bytes
-        db.createObjectStore('photoBlobs', { keyPath: 'id' });
       }
       if (!db.objectStoreNames.contains('meta')) {
         db.createObjectStore('meta');
@@ -179,80 +175,6 @@ async function idbGetMeta(key) {
   });
 }
 
-async function idbGetOne(storeName, key) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(storeName, 'readonly');
-    const req = tx.objectStore(storeName).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-// Runs async tasks over `items` with at most `limit` running concurrently.
-// Keeps us from firing hundreds of simultaneous requests at Google Drive.
-async function asyncPool(limit, items, iteratorFn) {
-  const ret = [];
-  const executing = new Set();
-  for (const item of items) {
-    const p = Promise.resolve().then(() => iteratorFn(item));
-    ret.push(p);
-    executing.add(p);
-    const clean = () => executing.delete(p);
-    p.then(clean, clean);
-    if (executing.size >= limit) {
-      await Promise.race(executing);
-    }
-  }
-  return Promise.all(ret);
-}
-
-async function fetchImageBlob(photoid) {
-  const url = `https://drive.google.com/thumbnail?id=${photoid}`;
-  const res = await fetch(url, { mode: 'cors' });
-  if (!res.ok) throw new Error('Photo fetch failed: ' + photoid);
-  return await res.blob();
-}
-
-// Downloads and caches only photos that are new or whose photoid changed
-// (i.e. the member's photo was replaced with a different Drive file).
-// Falls back silently per-photo if Drive blocks the fetch (e.g. CORS) -
-// nameclick() will just use the live Drive URL for those instead.
-async function syncPhotoBlobs(photos) {
-  const db = await openDB();
-  const existing = await idbGetAll('photoBlobs');
-  const existingMap = new Map(existing.map(p => [p.id, p]));
-
-  const needsFetch = photos.filter(p => {
-    const cur = existingMap.get(p.id);
-    return !cur || cur.photoid !== p.photoid;
-  });
-
-  if (needsFetch.length > 0) {
-    await asyncPool(6, needsFetch, async (p) => {
-      try {
-        const blob = await fetchImageBlob(p.photoid);
-        const tx = db.transaction('photoBlobs', 'readwrite');
-        tx.objectStore('photoBlobs').put({ id: p.id, photoid: p.photoid, blob });
-        await new Promise((resolve, reject) => {
-          tx.oncomplete = resolve;
-          tx.onerror = () => reject(tx.error);
-        });
-      } catch (err) {
-        console.warn('Could not cache photo for member', p.id, err);
-      }
-    });
-  }
-
-  // Drop cached blobs for members no longer in the sheet
-  const currentIds = new Set(photos.map(p => p.id));
-  const stale = existing.filter(p => !currentIds.has(p.id));
-  if (stale.length > 0) {
-    const tx = db.transaction('photoBlobs', 'readwrite');
-    stale.forEach(p => tx.objectStore('photoBlobs').delete(p.id));
-  }
-}
-
 //==== Fetch Data Functions ====
 async function fetchJson(url) {
   const res = await fetch(url, { cache: 'no-store' });
@@ -289,7 +211,6 @@ async function fetchPhotoData() {
   data.shift();
   const photos = data.map(([id, photoid]) => ({ id: Number(id), photoid }));
   await idbPutAll('photos', photos);
-  await syncPhotoBlobs(photos);
   return photos;
 }
 
@@ -316,10 +237,14 @@ function showReport(addBookData, photoData, source, serverTimestamp) {
 }
 
 
-// One-time migration for users still on the old localStorage-based version.
-// Runs once, flagged in IndexedDB so it never repeats, and stops touching
-// localStorage entirely from then on.
+// One-time migration for users still on the old version, which stored the
+// timestamp in localStorage and the actual data in the Cache API. Runs once,
+// flagged in IndexedDB so it never repeats, and stops touching localStorage
+// or the old cache entirely from then on. Migrating the cached data (not just
+// the timestamp) means upgrading users see their existing data immediately
+// instead of a brief "waiting for server" empty state.
 const LEGACY_MIGRATION_FLAG = 'migratedFromLocalStorage_v1';
+const LEGACY_CACHE_NAME = 'addbook';
 
 async function migrateLegacyStorage() {
   try {
@@ -329,6 +254,7 @@ async function migrateLegacyStorage() {
     console.warn('Could not check migration flag, proceeding cautiously:', err);
   }
 
+  // 1. Migrate the timestamp from localStorage
   try {
     const legacyTimestamp = localStorage.getItem('data_updated_at');
     if (legacyTimestamp) {
@@ -342,6 +268,43 @@ async function migrateLegacyStorage() {
   } catch (err) {
     // localStorage may be unavailable (private browsing etc) - safe to skip
     console.warn('Legacy localStorage migration skipped:', err);
+  }
+
+  // 2. Migrate the actual records from the old Cache API storage, so
+  //    upgrading users get an instant report instead of an empty state
+  //    while waiting for the network fetch to complete.
+  try {
+    const existingAddbook = await idbGetAll('addbook');
+    const existingPhotos = await idbGetAll('photos');
+    if ((!existingAddbook || !existingAddbook.length) && 'caches' in window) {
+      const cache = await caches.open(LEGACY_CACHE_NAME);
+
+      const addbookResp = await cache.match('/custom/addbookdata.json');
+      if (addbookResp && addbookResp.ok) {
+        const oldAddbook = await addbookResp.json();
+        if (Array.isArray(oldAddbook) && oldAddbook.length) {
+          // Ensure ids are normalized to Number for consistent IndexedDB keys
+          const normalized = oldAddbook.map(r => ({ ...r, id: Number(r.id) }));
+          await idbPutAll('addbook', normalized);
+          console.log('Migrated', normalized.length, 'addbook records from Cache API to IndexedDB');
+        }
+      }
+
+      const photosResp = await cache.match('/custom/addbookphotodata.json');
+      if (photosResp && photosResp.ok) {
+        const oldPhotos = await photosResp.json();
+        if (Array.isArray(oldPhotos) && oldPhotos.length) {
+          const normalized = oldPhotos.map(r => ({ ...r, id: Number(r.id) }));
+          await idbPutAll('photos', normalized);
+          console.log('Migrated', normalized.length, 'photo records from Cache API to IndexedDB');
+        }
+      }
+
+      // Clean up the old cache now that its contents have been migrated
+      await caches.delete(LEGACY_CACHE_NAME);
+    }
+  } catch (err) {
+    console.warn('Legacy Cache API migration skipped:', err);
   }
 
   await idbSetMeta(LEGACY_MIGRATION_FLAG, true);
@@ -482,29 +445,12 @@ function selectedRegion(array, n) {
 
             span.onclick = function() {modal.style.display = "none";}
 
-            let lastPhotoObjectUrl = null;
-
-            async function nameclick(membershipNo) {
+            function nameclick(membershipNo) {
                 let toDisplay = "<table border=1><tr>";
                 document.getElementById("myInput").value = "";
                 let membno = membershipNo * 1;
                  memphotoid = photodata.filter(a => a.id.toString() === membershipNo.toString());
-
-                 // Revoke the previous object URL so we don't leak memory across opens
-                 if (lastPhotoObjectUrl) { URL.revokeObjectURL(lastPhotoObjectUrl); lastPhotoObjectUrl = null; }
-
-                 memphoto = "";
-                 if (memphotoid.length > 0) {
-                   let cached = null;
-                   try { cached = await idbGetOne('photoBlobs', membno); } catch { cached = null; }
-                   if (cached && cached.blob) {
-                     lastPhotoObjectUrl = URL.createObjectURL(cached.blob);
-                     memphoto = `<img src='${lastPhotoObjectUrl}' height=100 width=100>`;
-                   } else {
-                     // Not cached (or Drive blocked the fetch) - fall back to live Drive URL
-                     memphoto = `<img src='https://drive.google.com/thumbnail?id=${memphotoid[0].photoid}' height=100 width=100>`;
-                   }
-                 }
+                 memphoto = memphotoid.length>0 ? `<img  src='https://drive.google.com/thumbnail?id=${memphotoid[0].photoid}' height=100 width=100'>` :""
                 let membData = activeMembers.filter(a => a.id === membno);
                 let dob = membData[0].dob;
                 let doj = membData[0].doj;
