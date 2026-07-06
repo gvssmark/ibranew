@@ -1,5 +1,4 @@
 const APP_CACHE = "app-shell-v1";
-
 // List of core files for offline availability
 const APP_ASSETS = [
   "index.html",
