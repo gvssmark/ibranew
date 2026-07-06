@@ -333,12 +333,6 @@ async function initReport() {
     localTimestamp = await idbGetMeta("data_updated_at");
 
     if (!addBookData.length || localTimestamp != serverTimestamp) {
-
-      // 👉 Show modal ONLY if timestamps differ (and not first load)
-      if (localTimestamp && localTimestamp != serverTimestamp) {
-       // showUpdateModal("Latest Data Loaded");
-      }
-
       // Fetch fresh if missing or outdated
       addBookData = await fetchAddBookData();
 
@@ -346,13 +340,11 @@ async function initReport() {
 
       showReport(addBookData, "Server (updated)", serverTimestamp);
       showUpdateModal("Latest Data Loaded");
-      //document.getElementById("loader").style.display="none"
     }
     document.getElementById("loader").style.display="none"
 document.getElementById("datadate").style.display="block"
 document.getElementById("datadate").innerHTML= new Date().toLocaleString('en-GB', {timeZone: 'Asia/Kolkata'})
-    showUpdateModal("Data Loaded");
-    
+
   } catch (err) {
     console.error("Background refresh failed", err);
   }
